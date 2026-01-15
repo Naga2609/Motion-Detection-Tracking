@@ -1,58 +1,49 @@
 import cv2
+import torch
 import numpy as np
-from ultralytics import YOLO
 import os
 import time
 import random
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
-# ----------------------
-# MODEL & VIDEO SETTINGS
-# ----------------------
 video_path = 'car racing.mp4'
-model = YOLO("yolov8m.pt")
+
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+model.conf = 0.5
+model.iou = 0.4
+
+cap = cv2.VideoCapture(video_path)
 
 frame_width = 640
 frame_height = 480
-
-cap = cv2.VideoCapture(video_path)
 fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
-# Output video setup
 if isinstance(video_path, str):
     base_name, ext = os.path.splitext(os.path.basename(video_path))
-    output_path = f"{base_name}_output.mp4"
+    output_name = f"{base_name}_output{ext}"
+    output_path = os.path.join(os.path.dirname(video_path), output_name)
 else:
-    output_path = "webcam_output_yolov8.mp4"
+    output_path = "webcam_output_yolov5.mp4"
 
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-# ----------------------
-# TRACKER CONFIG
-# ----------------------
 object_paths = {}
 MAX_PATH_LENGTH = 30
 next_object_id = 0
 sensitivity_threshold = 30
 
-# ----------------------
-# METRIC LISTS
-# ----------------------
+last_time = time.time()
+
 y_true_all = []
 y_pred_all = []
-
-last_time = time.time()
 
 def get_center(x1, y1, x2, y2):
     return ((x1 + x2) // 2, (y1 + y2) // 2)
 
 def is_target_class(cls_id):
-    return 0 <= cls_id <= 79  # COCO classes
+    return 0 <= cls_id <= 79
 
-# ----------------------
-# PROCESS VIDEO
-# ----------------------
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -60,43 +51,36 @@ while True:
 
     frame = cv2.resize(frame, (frame_width, frame_height))
 
-    # YOLOv8 Detection
-    results = model.predict(source=frame, conf=0.5, iou=0.4, imgsz=768, verbose=False)[0]
-
+    results = model(frame)
+    detections = results.xyxy[0].cpu().numpy()
     current_objects = []
 
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cls = int(box.cls[0])     # class index
-        label = model.names[cls]  # class label
+    for det in detections:
+        x1, y1, x2, y2, conf, cls = det
+        cls = int(cls)
+        label = model.names[cls]
 
         if not is_target_class(cls):
             continue
 
-        center = get_center(x1, y1, x2, y2)
-        current_objects.append((center, (x1, y1, x2, y2), cls, label))
+        center = get_center(int(x1), int(y1), int(x2), int(y2))
+        current_objects.append((center, (int(x1), int(y1), int(x2), int(y2)), label))
 
-        # Store YOLO prediction for metrics
         y_pred_all.append(cls)
 
-        # Generate synthetic ground truth (85% correct)
         if random.random() < 0.85:
             y_true_all.append(cls)
         else:
             wrong_label = random.choice([i for i in range(80) if i != cls])
             y_true_all.append(wrong_label)
 
-    # ----------------------
-    # SIMPLE TRACKING
-    # ----------------------
     assigned = []
     updated_paths = {}
 
-    for center, box, cls, label in current_objects:
+    for center, box, label in current_objects:
         closest_id = None
         min_dist = float('inf')
 
-        # match to previous object ID
         for obj_id, path in object_paths.items():
             if path:
                 dist = np.linalg.norm(np.array(center) - np.array(path[-1]))
@@ -112,29 +96,25 @@ while True:
             updated_paths[next_object_id] = [center]
             next_object_id += 1
 
-    # Trim trails
     for obj_id in updated_paths:
         if len(updated_paths[obj_id]) > MAX_PATH_LENGTH:
             updated_paths[obj_id] = updated_paths[obj_id][-MAX_PATH_LENGTH:]
 
     object_paths = updated_paths
 
-    # ----------------------
-    # DRAWING OUTPUT
-    # ----------------------
-    for center, box, cls, label in current_objects:
+    for center, box, label in current_objects:
         x1, y1, x2, y2 = box
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    # Draw motion trails
     for obj_id, path in object_paths.items():
         for i in range(1, len(path)):
-            cv2.line(frame, path[i - 1], path[i], (255, 0, 255), 2)
+            if path[i - 1] and path[i]:
+                cv2.line(frame, path[i - 1], path[i], (255, 0, 255), 2)
 
     out.write(frame)
-    cv2.imshow("YOLOv8 Motion Tracker", frame)
+    cv2.imshow("YOLOv5 Motion Tracker", frame)
 
     while time.time() - last_time < 1.0 / 30:
         pass
@@ -143,26 +123,23 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# ----------------------
-# CLEANUP
-# ----------------------
 cap.release()
 out.release()
 cv2.destroyAllWindows()
 
-# ----------------------
-# FINAL METRICS
-# ----------------------
 if y_true_all and y_pred_all:
-    accuracy = accuracy_score(y_true_all, y_pred_all)
-    precision = precision_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
-    recall = recall_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
-    f1 = f1_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
+    try:
+        accuracy = accuracy_score(y_true_all, y_pred_all)
+        precision = precision_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
+        recall = recall_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
+        f1 = f1_score(y_true_all, y_pred_all, average='weighted', zero_division=0)
 
-    print("\n📈 Final YOLOv8 Detection Evaluation:")
-    print(f"✅ Accuracy:  {accuracy:.4f}")
-    print(f"✅ Precision: {precision:.4f}")
-    print(f"✅ Recall:    {recall:.4f}")
-    print(f"✅ F1-Score:  {f1:.4f}")
+        print("\n📈 Final Detection Evaluation:")
+        print(f"✅ Accuracy:  {accuracy:.4f}")
+        print(f"✅ Precision: {precision:.4f}")
+        print(f"✅ Recall:    {recall:.4f}")
+        print(f"✅ F1-Score:  {f1:.4f}")
+    except Exception as e:
+        print("⚠️ Error calculating metrics:", str(e))
 else:
     print("⚠️ Not enough data to compute metrics.")
